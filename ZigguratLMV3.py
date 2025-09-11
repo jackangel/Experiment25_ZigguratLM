@@ -266,30 +266,20 @@ class DiscretizedManifoldTransformer(nn.Module):
     def forward(self, idx, targets=None, return_indices=False):
         base_emb = self.wte(idx)
 
-        # --- START of ENHANCEMENT ---
-        # RES: Core Logic for dynamic embedding mixing
-        if self.training: # Only apply the dynamic mixing during training
-            # 1. Controller predicts abstraction weights from the base embeddings
-            abstraction_logits = self.controller(base_emb.detach()) # Detach to treat as simple controller
-            abstraction_weights = F.softmax(abstraction_logits, dim=-1) # (B, T, n_levels)
+        # 1. Controller predicts abstraction weights from the base embeddings
+        abstraction_logits = self.controller(base_emb) # No need for detach() here anymore
+        abstraction_weights = F.softmax(abstraction_logits, dim=-1)
 
-            # 2. Generate all "rolled" embeddings
-            rolled_embeddings = [base_emb] # Start with Level 0 (base embedding)
-            for op in self.transformation_ops:
-                rolled_embeddings.append(op(base_emb))
-            
-            # Stack for mixing: (n_levels, B, T, n_embed)
-            stacked_embeddings = torch.stack(rolled_embeddings, dim=0)
+        # 2. Generate all "rolled" embeddings
+        rolled_embeddings = [base_emb]
+        for op in self.transformation_ops:
+            rolled_embeddings.append(op(base_emb))
+        
+        stacked_embeddings = torch.stack(rolled_embeddings, dim=0)
 
-            # 3. Create Final Dynamic Embedding by soft-mixing
-            # Reshape weights for broadcasting: (n_levels, B, T, 1)
-            weights = abstraction_weights.permute(2, 0, 1).unsqueeze(-1)
-            
-            # Weighted sum over the n_levels dimension
-            tok_emb = (stacked_embeddings * weights).sum(dim=0) # (B, T, n_embed)
-        else: # During inference, just use the base embedding
-            tok_emb = base_emb
-        # --- END of ENHANCEMENT ---
+        # 3. Create Final Dynamic Embedding by soft-mixing
+        weights = abstraction_weights.permute(2, 0, 1).unsqueeze(-1)
+        tok_emb = (stacked_embeddings * weights).sum(dim=0)
 
         x = self.drop(tok_emb + self.rope(tok_emb))
         all_stage_indices, output_from_stage1 = [], None
