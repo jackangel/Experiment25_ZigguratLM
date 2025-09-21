@@ -129,7 +129,7 @@ if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    BATCH_SIZE = 6
+    BATCH_SIZE = 18
     EVAL_EVERY = 20000
     CHECKPOINT_DIR = "checkpoints"
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -140,20 +140,39 @@ if __name__ == '__main__':
     model = DiscretizedManifoldTransformer(config).to(device)
     print(f"Model initialized with {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters.")
     
-    # Optimizer for the MAIN predictive path (embeddings, stage 1, heads)
+    # Separate optimizers with different learning rates
+    main_lr = 3e-4
+    q_lr = 3e-5  # 10x smaller
+    confidence_lr = 3e-5  # 10x smaller
+
+    # Main path parameters (excluding confidence head and VQ components)
     main_path_params = (
         list(model.wte.parameters()) +
         list(model.rope.parameters()) +
         list(model.controller.parameters()) +
         list(model.transformation_ops.parameters()) +
-        list(model.stages[0].parameters()) +
         list(model.ln_f.parameters()) +
         list(model.lm_head.parameters())
     )
-    if config.use_confidence_circuit:
-        main_path_params += list(model.confidence_head.parameters())
 
-    final_optimizer = torch.optim.AdamW(main_path_params, lr=3e-4, betas=(0.9, 0.95))
+    # Stage 1 parameters (excluding VQ layers)
+    stage1_non_vq_params = []
+    stage1_vq_params = []
+    for block in model.stages[0]:
+        # Add non-VQ parameters
+        stage1_non_vq_params.extend([p for name, p in block.named_parameters() if 'vq' not in name.lower() and 'quantizer' not in name.lower()])
+        # Add VQ parameters  
+        stage1_vq_params.extend([p for name, p in block.named_parameters() if 'vq' in name.lower() or 'quantizer' in name.lower()])
+
+    main_path_params.extend(stage1_non_vq_params)
+
+    # Create optimizers
+    final_optimizer = torch.optim.AdamW(main_path_params, lr=main_lr, betas=(0.9, 0.95))
+    q_optimizer = torch.optim.AdamW(stage1_vq_params, lr=q_lr, betas=(0.9, 0.95))
+
+    confidence_optimizer = None
+    if config.use_confidence_circuit:
+        confidence_optimizer = torch.optim.AdamW(model.confidence_head.parameters(), lr=confidence_lr, betas=(0.9, 0.95))
 
     if args.parquet_folder:
         if pd is None: raise ImportError("Pandas is not installed. Please run 'pip install pandas pyarrow'.")
@@ -216,10 +235,21 @@ if __name__ == '__main__':
                 total_aux_loss = sum(stage1_recon_losses) / len(stage1_recon_losses) + sum(stage1_q_losses) / len(stage1_q_losses)
                 total_main_loss = ce_loss + total_aux_loss + (conf_loss * config.confidence_loss_weight)
 
-            # 5. Backward pass for the main path
+            # 5. Backward pass with separate optimizers
+            # Zero all gradients
             final_optimizer.zero_grad()
+            q_optimizer.zero_grad()
+            if confidence_optimizer is not None:
+                confidence_optimizer.zero_grad()
+
+            # Backward pass
             total_main_loss.backward()
+
+            # Step optimizers
             final_optimizer.step()
+            q_optimizer.step()
+            if confidence_optimizer is not None:
+                confidence_optimizer.step()
 
             # --- 6. Decoupled local updates for stages 2 and beyond ---
             x = output_from_stage1.detach() # Detach here to create a new graph starting point
